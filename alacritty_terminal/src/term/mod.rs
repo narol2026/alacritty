@@ -28,6 +28,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+pub mod osc;
 pub mod search;
 
 /// Minimum number of columns.
@@ -316,6 +317,15 @@ pub struct Term<T> {
     /// term is set.
     title_stack: Vec<Option<String>>,
 
+    /// Cursor position recorded at the OSC 633 ; B marker (end of the prompt,
+    /// start of the command). Used to extract the command region from the grid
+    /// when the OSC 633 ; C marker arrives; `None` between commands.
+    osc633_command_start: Option<Point>,
+
+    /// Command text reported by `OSC 633 ; E`, awaiting the matching
+    /// `OSC 633 ; C` marker.  Prefer this over grid-region extraction.
+    osc633_command: Option<String>,
+
     /// The stack for the keyboard modes.
     keyboard_mode_stack: Vec<KeyboardModes>,
 
@@ -437,6 +447,8 @@ impl<T> Term<T> {
             cursor_style: Default::default(),
             colors: color::Colors::default(),
             title_stack: Default::default(),
+            osc633_command_start: None,
+            osc633_command: None,
             is_focused: Default::default(),
             selection: Default::default(),
             title: Default::default(),
@@ -2232,6 +2244,33 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     #[inline]
+    fn osc(&mut self, code: &[u8], params: &[&[u8]], bell_terminated: bool) -> bool {
+        let parsed = osc::parse(code, params, bell_terminated);
+        if !parsed.recognized {
+            return false;
+        }
+
+        if let Some(message) = parsed.message {
+            match message {
+                osc::OscMessage::WorkingDirectory(path) => {
+                    self.osc_working_directory(path);
+                },
+                osc::OscMessage::PromptStart => self.osc_prompt_start(),
+                osc::OscMessage::CommandStart => self.osc_command_start(),
+                osc::OscMessage::CommandLine(command) => {
+                    self.osc_command_line(command.as_str())
+                },
+                osc::OscMessage::CommandExecuted(_) => self.osc_command_executed(),
+                osc::OscMessage::CommandFinished(exit_code) => {
+                    self.osc_command_finished(exit_code)
+                },
+            }
+        }
+
+        true
+    }
+
+    #[inline]
     fn push_title(&mut self) {
         trace!("Pushing '{:?}' onto title stack", self.title);
 
@@ -2268,6 +2307,69 @@ impl<T: EventListener> Handler for Term<T> {
     fn text_area_size_chars(&mut self) {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
+    }
+}
+
+impl<T: EventListener> Term<T> {
+    #[inline]
+    fn osc_working_directory(&mut self, path: String) {
+        trace!("Working directory from OSC 7: '{path}'");
+        self.event_proxy
+            .send_event(Event::Osc(osc::OscMessage::WorkingDirectory(path)));
+    }
+
+    #[inline]
+    fn osc_prompt_start(&mut self) {
+        trace!("Prompt start marker (OSC 633 ; A)");
+        self.event_proxy
+            .send_event(Event::Osc(osc::OscMessage::PromptStart));
+    }
+
+    #[inline]
+    fn osc_command_start(&mut self) {
+        trace!("Command start marker (OSC 633 ; B)");
+        // Record the exact column where the prompt ended — the boundary
+        // between what the shell painted and what the user is about to type.
+        // This cannot be recovered later, so it is captured here.
+        self.osc633_command_start = Some(self.grid.cursor.point);
+        // Drop any stale command text from a previous cycle; a fresh
+        // OSC 633 ; E follows before the next OSC 633 ; C.
+        self.osc633_command = None;
+        self.event_proxy
+            .send_event(Event::Osc(osc::OscMessage::CommandStart));
+    }
+
+    #[inline]
+    fn osc_command_line(&mut self, command: &str) {
+        let command = command.trim();
+        self.osc633_command = (!command.is_empty()).then(|| command.to_string());
+    }
+
+    #[inline]
+    fn osc_command_executed(&mut self) {
+        trace!("Command executed marker (OSC 633 ; C)");
+        // Prefer the command text reported by the preceding OSC 633 ; E.
+        // Fall back to the legacy screen-region extraction when the shell
+        // emitted only the bare marker.
+        let command = if let Some(cmd) = self.osc633_command.take() {
+            self.osc633_command_start = None;
+            cmd
+        } else {
+            self.osc633_command_start.take().map_or_else(String::new, |start| {
+                self.bounds_to_string(start, self.grid.cursor.point)
+                    .trim_end()
+                    .to_string()
+            })
+        };
+        self.event_proxy
+            .send_event(Event::Osc(osc::OscMessage::CommandExecuted(command)));
+    }
+
+    #[inline]
+    fn osc_command_finished(&mut self, exit_code: Option<i32>) {
+        trace!("Command finished marker (OSC 633 ; D): exit_code={exit_code:?}");
+        self.event_proxy
+            .send_event(Event::Osc(osc::OscMessage::CommandFinished(exit_code)));
     }
 }
 
@@ -3298,5 +3400,110 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    /// Captures terminal events for assertion (`EventListener` hands out `&self`).
+    struct EventLog(std::cell::RefCell<Vec<Event>>);
+
+    impl EventListener for EventLog {
+        fn send_event(&self, event: Event) {
+            self.0.borrow_mut().push(event);
+        }
+    }
+
+    #[test]
+    fn osc633_command_region_extraction() {
+        let size = TermSize::new(3, 20);
+        let mut term = Term::new(Config::default(), &size, EventLog(std::cell::RefCell::new(Vec::new())));
+
+        // Shell paints the prompt "$ " then emits OSC 633 ; B at its end.
+        term.input('$');
+        term.input(' ');
+        term.osc_command_start();
+
+        // User types a command on the prompt line.
+        for c in "ls -la".chars() {
+            term.input(c);
+        }
+
+        // bash echoes the LF before the preexec hook runs, so when OSC 633 ; C
+        // fires the cursor sits on the line below the command. The region must
+        // still read back as the exact command text (trailing newline trimmed).
+        term.linefeed();
+        term.osc_command_executed();
+
+        let events = term.event_proxy.0.borrow();
+        assert!(matches!(
+            events.last(),
+            Some(Event::Osc(osc::OscMessage::CommandExecuted(cmd))) if cmd == "ls -la"
+        ));
+    }
+
+    #[test]
+    fn osc633_command_region_extraction_zsh_style() {
+        let size = TermSize::new(3, 20);
+        let mut term = Term::new(Config::default(), &size, EventLog(std::cell::RefCell::new(Vec::new())));
+
+        // zsh fires the preexec hook before echoing the LF, so the cursor still
+        // sits at the end of the command line when OSC 633 ; C arrives.
+        term.input('$');
+        term.input(' ');
+        term.osc_command_start();
+        for c in "echo hi".chars() {
+            term.input(c);
+        }
+        term.osc_command_executed();
+
+        let events = term.event_proxy.0.borrow();
+        assert!(matches!(
+            events.last(),
+            Some(Event::Osc(osc::OscMessage::CommandExecuted(cmd))) if cmd == "echo hi"
+        ));
+    }
+
+    #[test]
+    fn percent_decode_keeps_multibyte_utf8() {
+        // A percent-encoded multi-byte path must decode back to its original
+        // characters, not one codepoint per encoded byte (mojibake).
+        assert_eq!(osc::percent_decode("/home/%E4%B8%AD"), "/home/中");
+        assert_eq!(osc::percent_decode("/a%20b"), "/a b");
+        assert_eq!(osc::percent_decode("/raw/中"), "/raw/中");
+    }
+
+    #[test]
+    fn osc633_command_executed_without_start_is_blank() {
+        // A shell that emits OSC 633 ; C without a preceding 633 ; B must not
+        // fabricate a command: the payload is blank and resets the marker.
+        let size = TermSize::new(3, 20);
+        let mut term = Term::new(Config::default(), &size, EventLog(std::cell::RefCell::new(Vec::new())));
+
+        term.input('x');
+        term.osc_command_executed();
+        term.osc_command_executed();
+
+        let events = term.event_proxy.0.borrow();
+        assert!(matches!(
+            events.last(),
+            Some(Event::Osc(osc::OscMessage::CommandExecuted(cmd))) if cmd.is_empty()
+        ));
+        // Only the two CommandExecuted events were emitted, no region residue.
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn osc633_command_line_payload() {
+        let size = TermSize::new(3, 20);
+        let mut term = Term::new(Config::default(), &size, EventLog(std::cell::RefCell::new(Vec::new())));
+
+        // A shell that carries the command in OSC 633 ; E needs no preceding
+        // OSC 633 ; B marker, and no screen region is inspected.
+        term.osc_command_line("ls -ld");
+        term.osc_command_executed();
+
+        let events = term.event_proxy.0.borrow();
+        assert!(matches!(
+            events.last(),
+            Some(Event::Osc(osc::OscMessage::CommandExecuted(cmd))) if cmd == "ls -ld"
+        ));
     }
 }

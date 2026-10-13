@@ -153,6 +153,13 @@ where
             // Parse the incoming bytes.
             state.parser.advance(&mut **terminal, &buf[..unprocessed]);
 
+            // Expose the raw chunk *after* parsing so the event channel keeps
+            // semantic marker order (e.g. OSC 633 ; C) ahead of the bytes that
+            // contained it.  The application uses this for command-output
+            // capture between shell-integration markers.
+            self.event_proxy
+                .send_event(Event::PtyOutput(buf[..unprocessed].to_vec()));
+
             processed += unprocessed;
             unprocessed = 0;
 

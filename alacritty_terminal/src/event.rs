@@ -3,6 +3,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use crate::term::ClipboardType;
+use crate::term::osc::OscMessage;
 use crate::vte::ansi::Rgb;
 
 /// Terminal event.
@@ -19,6 +20,16 @@ pub enum Event {
 
     /// Reset to the default window title.
     ResetTitle,
+
+    /// Semantic OSC message interpreted by the terminal.
+    Osc(OscMessage),
+
+    /// Raw bytes read from the PTY before VTE parsing.
+    ///
+    /// This is emitted after the parser has processed the same chunk, so the
+    /// application receives semantic OSC messages before the raw bytes that
+    /// triggered them.
+    PtyOutput(Vec<u8>),
 
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
@@ -73,6 +84,8 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(code) => write!(f, "ChildExit({code})"),
+            Event::Osc(message) => write!(f, "Osc({message:?})"),
+            Event::PtyOutput(bytes) => write!(f, "PtyOutput({} bytes)", bytes.len()),
         }
     }
 }
