@@ -20,7 +20,7 @@ use polling::{Event, PollMode, Poller};
 use rustix_openpty::openpty;
 use rustix_openpty::rustix::termios::Winsize;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use rustix_openpty::rustix::termios::{self, InputModes, OptionalActions};
+use rustix_openpty::rustix::termios::{self, InputModes, LocalModes, OptionalActions};
 use signal_hook::low_level::{pipe as signal_pipe, unregister as unregister_signal};
 use signal_hook::{SigId, consts as sigconsts};
 
@@ -209,6 +209,19 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
         // Set character encoding to UTF-8.
         termios.input_modes.set(InputModes::IUTF8, true);
         let _ = termios::tcsetattr(&master, OptionalActions::Now, &termios);
+    }
+
+    // Disable kernel echo on the slave PTY so that the Enter key's \r does not
+    // produce an extra linefeed from echo output-processing. The shell (ZLE /
+    // readline) handles its own echo in raw mode, and re-enables echo when
+    // switching to cooked mode for foreground commands.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Ok(mut termios) = termios::tcgetattr(&slave) {
+        termios.local_modes.set(LocalModes::ECHO, false);
+        termios.local_modes.set(LocalModes::ECHOE, false);
+        termios.local_modes.set(LocalModes::ECHOK, false);
+        termios.local_modes.set(LocalModes::ECHONL, false);
+        let _ = termios::tcsetattr(&slave, OptionalActions::Now, &termios);
     }
 
     let user = ShellUser::from_env()?;
